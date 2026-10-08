@@ -35,6 +35,10 @@ export interface ProcessInfo {
   stderrFile: string;
   /** "pid command" for processes the command left running in its process group when it ended. */
   leftovers?: string[];
+  /** Why the latest log read failed; absent once a read succeeds. */
+  logReadError?: string;
+  /** The first failed log write: output after it may be missing. */
+  logWriteError?: string;
 }
 
 export type ManagerEvent =

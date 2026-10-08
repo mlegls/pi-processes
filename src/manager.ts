@@ -81,7 +81,6 @@ interface ManagedProcess extends ProcessInfo {
   leaderExitCode: number | null;
   leaderExitSignal: NodeJS.Signals | null;
   processError: boolean;
-  logError: boolean;
   closeWaiters: Set<() => void>;
   endWaiters: Set<() => void>;
   logs: Record<StreamName, BoundedLogFile>;
@@ -169,11 +168,12 @@ export class ProcessManager {
         managed.triggerAgentTurnOnEnd && managed.activeWaits === 0;
       endedEvent = {
         type: "process_ended",
-        info: this.toProcessInfo(managed),
-        triggerAgentTurn,
+        // Read first so the info snapshot carries any read error.
         recentOutput: triggerAgentTurn
           ? this.readCombinedOutput(managed, RECENT_OUTPUT_LINES)
           : null,
+        info: this.toProcessInfo(managed),
+        triggerAgentTurn,
         ...(readinessPattern ? { readinessPattern } : {}),
         ...(managed.completionSummaryFile
           ? { completionSummaryFile: managed.completionSummaryFile }
@@ -431,7 +431,6 @@ export class ProcessManager {
       leaderExitCode: null,
       leaderExitSignal: null,
       processError: false,
-      logError: false,
       closeWaiters: new Set(),
       endWaiters: new Set(),
       logs: { stdout: stdoutLog, stderr: stderrLog },
@@ -441,8 +440,10 @@ export class ProcessManager {
     };
 
     const recordLogFailures = (results: PromiseSettledResult<void>[]) => {
-      if (results.some((result) => result.status === "rejected")) {
-        managed.logError = true;
+      for (const result of results) {
+        if (result.status === "rejected") {
+          this.noteLogWriteFailure(managed, result.reason);
+        }
       }
     };
 
@@ -511,9 +512,7 @@ export class ProcessManager {
       }
       void managed
         .closeLogs()
-        .catch(() => {
-          managed.logError = true;
-        })
+        .catch((error: unknown) => this.noteLogWriteFailure(managed, error))
         .then(() => {
           managed.leaderClosed = true;
           for (const waiter of managed.closeWaiters) waiter();
@@ -543,9 +542,7 @@ export class ProcessManager {
       }
       void managed
         .closeLogs()
-        .catch(() => {
-          managed.logError = true;
-        })
+        .catch((error: unknown) => this.noteLogWriteFailure(managed, error))
         .then(() => {
           managed.leaderClosed = true;
           for (const waiter of managed.closeWaiters) waiter();
@@ -720,21 +717,15 @@ export class ProcessManager {
     const managed = this.processes.get(id);
     if (!managed) return null;
 
-    try {
-      await managed.flushLogs();
-    } catch {
-      managed.logError = true;
-      return null;
-    }
-    if (managed.logError) return null;
-    const [stdout, stderr] = await Promise.all([
-      managed.logs.stdout.readTailLines(tailLines, LOG_READ_MAX_BYTES),
-      managed.logs.stderr.readTailLines(tailLines, LOG_READ_MAX_BYTES),
-    ]).catch(() => [null, null]);
-    if (!stdout || !stderr) {
-      managed.logError = true;
-      return null;
-    }
+    await this.flushBeforeRead(managed);
+    const output = await this.readLogs(managed, () =>
+      Promise.all([
+        managed.logs.stdout.readTailLines(tailLines, LOG_READ_MAX_BYTES),
+        managed.logs.stderr.readTailLines(tailLines, LOG_READ_MAX_BYTES),
+      ]),
+    );
+    if (!output) return null;
+    const [stdout, stderr] = output;
 
     return {
       stdout,
@@ -755,23 +746,17 @@ export class ProcessManager {
     const managed = this.processes.get(id);
     if (!managed) return null;
 
-    try {
-      await managed.flushLogs();
-    } catch {
-      managed.logError = true;
-      return null;
-    }
-    if (managed.logError) return null;
+    await this.flushBeforeRead(managed);
 
     const firstRead = managed.agentReadAt === null;
-    const [stdout, stderr] = await Promise.all([
-      this.readAgentLines(managed, "stdout"),
-      this.readAgentLines(managed, "stderr"),
-    ]).catch(() => [null, null]);
-    if (!stdout || !stderr) {
-      managed.logError = true;
-      return null;
-    }
+    const output = await this.readLogs(managed, () =>
+      Promise.all([
+        this.readAgentLines(managed, "stdout"),
+        this.readAgentLines(managed, "stderr"),
+      ]),
+    );
+    if (!output) return null;
+    const [stdout, stderr] = output;
 
     const previousReadAt = managed.agentReadAt;
     const hasNewOutput = stdout.lines.length > 0 || stderr.lines.length > 0;
@@ -800,14 +785,13 @@ export class ProcessManager {
   private async readAgentLines(
     managed: ManagedProcess,
     stream: StreamName,
-  ): Promise<{ lines: string[]; skipped: boolean } | null> {
+  ): Promise<{ lines: string[]; skipped: boolean }> {
     const cursor = managed.agentCursors[stream];
     const result = await managed.logs[stream].readLinesFrom(
       cursor.offset,
       LOG_READ_MAX_BYTES,
       { preferNewest: true },
     );
-    if (!result) return null;
     if (result.endOffset === cursor.end) return { lines: [], skipped: false };
 
     cursor.offset = result.nextOffset;
@@ -823,12 +807,11 @@ export class ProcessManager {
     managed: ManagedProcess,
     stream: StreamName,
     cursor: { offset: number; skipped: boolean },
-  ): Promise<{ lines: string[]; advanced: boolean } | null> {
+  ): Promise<{ lines: string[]; advanced: boolean }> {
     const result = await managed.logs[stream].readLinesFrom(
       cursor.offset,
       LOG_READ_MAX_BYTES,
     );
-    if (!result) return null;
 
     const advanced = result.nextOffset !== cursor.offset;
     cursor.skipped ||= result.skipped;
@@ -884,8 +867,8 @@ export class ProcessManager {
         if (!LIVE_STATUSES.has(managed.status)) {
           return {
             reason: "exited",
-            info: info(),
             recentOutput: await recentOutput(),
+            info: info(),
             ...completion(),
           };
         }
@@ -901,8 +884,8 @@ export class ProcessManager {
         if (result === "aborted") return { reason: "cancelled", info: info() };
         return {
           reason: LIVE_STATUSES.has(managed.status) ? "timeout" : "exited",
-          info: info(),
           recentOutput: await recentOutput(),
+          info: info(),
           ...completion(),
         };
       }
@@ -941,8 +924,8 @@ export class ProcessManager {
           if (wasLive) continue;
           return {
             reason: "exited",
-            info: info(),
             recentOutput: await recentOutput(),
+            info: info(),
             ...coverage(),
             ...completion(),
           };
@@ -955,8 +938,8 @@ export class ProcessManager {
         if (remaining <= 0) {
           return {
             reason: "timeout",
-            info: info(),
             recentOutput: await recentOutput(),
+            info: info(),
             ...coverage(),
           };
         }
@@ -997,25 +980,15 @@ export class ProcessManager {
     scanned: ScanCursors,
     pattern: string,
   ): Promise<{ line: string; stream: StreamName } | undefined | null> {
-    try {
-      await managed.flushLogs();
-    } catch {
-      managed.logError = true;
-      return null;
-    }
+    await this.flushBeforeRead(managed);
 
     const needle = pattern.toLowerCase();
     for (const stream of ["stdout", "stderr"] as const) {
       for (;;) {
-        const result = await this.readScanLines(
-          managed,
-          stream,
-          scanned[stream],
-        ).catch(() => null);
-        if (!result) {
-          managed.logError = true;
-          return null;
-        }
+        const result = await this.readLogs(managed, () =>
+          this.readScanLines(managed, stream, scanned[stream]),
+        );
+        if (!result) return null;
 
         const hit = result.lines.find((line) =>
           line.toLowerCase().includes(needle),
@@ -1033,31 +1006,54 @@ export class ProcessManager {
     managed: ManagedProcess,
     tailLines: number,
   ): ProcessOutputLine[] | null {
-    if (managed.logError) return null;
-    const rawLines = this.readTailLines(managed.combinedFile, tailLines);
-    if (!rawLines) {
-      managed.logError = true;
+    try {
+      const rawLines = this.readTailLines(managed.combinedFile, tailLines);
+      managed.logReadError = undefined;
+      return decodeCombinedLines(rawLines);
+    } catch (error) {
+      managed.logReadError = errorMessage(error);
       return null;
     }
-    return decodeCombinedLines(rawLines);
   }
 
   private async readCombinedOutputAfterFlush(
     managed: ManagedProcess,
     tailLines: number,
   ): Promise<ProcessOutputLine[] | null> {
+    await this.flushBeforeRead(managed);
+    const lines = await this.readLogs(managed, () =>
+      managed.combinedLog.readTailLines(tailLines, LOG_READ_MAX_BYTES),
+    );
+    return lines && decodeCombinedLines(lines);
+  }
+
+  private noteLogWriteFailure(managed: ManagedProcess, error: unknown): void {
+    managed.logWriteError ??= errorMessage(error);
+  }
+
+  /**
+   * Flush queued writes before a read. A failed write is recorded, and the
+   * logs are still read: the files keep everything written before it.
+   */
+  private async flushBeforeRead(managed: ManagedProcess): Promise<void> {
+    await managed
+      .flushLogs()
+      .catch((error: unknown) => this.noteLogWriteFailure(managed, error));
+  }
+
+  /** Run a log read, recording why it failed instead of throwing. */
+  private async readLogs<T>(
+    managed: ManagedProcess,
+    read: () => Promise<T>,
+  ): Promise<T | null> {
     try {
-      await managed.flushLogs();
-    } catch {
-      managed.logError = true;
+      const result = await read();
+      managed.logReadError = undefined;
+      return result;
+    } catch (error) {
+      managed.logReadError = errorMessage(error);
       return null;
     }
-    if (managed.logError) return null;
-    const lines = await managed.combinedLog
-      .readTailLines(tailLines, LOG_READ_MAX_BYTES)
-      .catch(() => null);
-    if (!lines) managed.logError = true;
-    return lines && decodeCombinedLines(lines);
   }
 
   async getCombinedOutput(
@@ -1397,7 +1393,7 @@ export class ProcessManager {
     }
   }
 
-  private readTailLines(filePath: string, lines: number): string[] | null {
+  private readTailLines(filePath: string, lines: number): string[] {
     return readLogTailLines(filePath, lines, LOG_READ_MAX_BYTES);
   }
 
@@ -1416,8 +1412,16 @@ export class ProcessManager {
       stdoutFile: managed.stdoutFile,
       stderrFile: managed.stderrFile,
       ...(managed.leftovers ? { leftovers: managed.leftovers } : {}),
+      ...(managed.logReadError ? { logReadError: managed.logReadError } : {}),
+      ...(managed.logWriteError
+        ? { logWriteError: managed.logWriteError }
+        : {}),
     };
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function decodeCombinedLines(lines: string[]): ProcessOutputLine[] {
