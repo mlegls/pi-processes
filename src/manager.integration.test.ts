@@ -389,14 +389,28 @@ describe("ProcessManager (real processes)", () => {
         daemon = Number(leftover?.split(" ")[0]);
         expect(() => process.kill(daemon as number, 0)).not.toThrow();
         expect(await buildCompletionReport(info as ProcessInfo, [])).toContain(
-          `left running; stop them if they are not wanted):\n  ${leftover}`,
+          `left running; stop them if they are not wanted: process kill id="${proc.id}"):\n  ${leftover}`,
         );
         expect(await manager.readAgentOutput(proc.id, 100)).toMatchObject({
           stdout: ["started"],
         });
+        const stopped = manager.killLeftovers(proc.id);
+        expect(stopped).toEqual([leftover]);
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          try {
+            process.kill(daemon as number, 0);
+          } catch {
+            daemon = undefined;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        expect(daemon).toBeUndefined();
       } finally {
         manager.cleanup();
-        expect(() => process.kill(daemon as number, 0)).not.toThrow();
+        if (daemon)
+          expect(() => process.kill(daemon as number, 0)).not.toThrow();
         if (daemon) process.kill(daemon, "SIGKILL");
       }
     },

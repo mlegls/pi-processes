@@ -32,7 +32,7 @@ export async function buildCompletionReport(
   ];
   if (info.leftovers?.length) {
     lines.push(
-      "Still running in its process group (left running; stop them if they are not wanted):",
+      `Still running in its process group (left running; stop them if they are not wanted: process kill id="${info.id}"):`,
       ...info.leftovers.map((member) => `  ${sanitizeLine(member)}`),
     );
   }

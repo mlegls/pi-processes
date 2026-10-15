@@ -1138,6 +1138,27 @@ export class ProcessManager {
     });
   }
 
+  /**
+   * Signal what a finished command left running in its group (named in its
+   * result), and only members still in that group, so a reused pid is never
+   * signalled. Returns the members signalled.
+   */
+  killLeftovers(id: string, signal: NodeJS.Signals = "SIGTERM"): string[] {
+    const managed = this.processes.get(id);
+    if (!managed?.leftovers?.length || LIVE_STATUSES.has(managed.status))
+      return [];
+    const named = new Set(managed.leftovers.map((m) => m.split(" ")[0]));
+    const still = groupMembers(managed.pid).filter((m) =>
+      named.has(m.split(" ")[0]),
+    );
+    for (const member of still) {
+      try {
+        process.kill(Number(member.split(" ")[0]), signal);
+      } catch {}
+    }
+    return still;
+  }
+
   async kill(
     id: string,
     opts?: {
